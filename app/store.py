@@ -9,11 +9,25 @@ process dies mid-tick.
 from __future__ import annotations
 
 import json
+import logging
 import sqlite3
 import threading
 from pathlib import Path
 
 from .allocation import Job, Loan, LoanStatus, Share
+
+logger = logging.getLogger("scheduler.store")
+
+
+class StorageError(RuntimeError):
+    """Raised when SQLite cannot persist a scheduler snapshot.
+
+    The snapshot write is transactional, so when this is raised the database
+    still holds the previous consistent state.  Callers that already mutated
+    in-memory state (the request entry points) must undo those mutations before
+    re-raising; the API surfaces this as a retryable 503.
+    """
+
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS shares (
@@ -195,7 +209,12 @@ class Store:
 
         with self.lock:
             cursor = self._connection.cursor()
-            cursor.execute("BEGIN IMMEDIATE")
+            try:
+                cursor.execute("BEGIN IMMEDIATE")
+            except sqlite3.Error as exc:
+                raise StorageError(
+                    f"could not start a database transaction: {exc}"
+                ) from exc
             try:
                 cursor.execute("DELETE FROM shares")
                 cursor.executemany(
@@ -222,9 +241,33 @@ class Store:
                     loan_rows,
                 )
                 cursor.execute("COMMIT")
-            except Exception:
-                cursor.execute("ROLLBACK")
-                raise
+            except Exception as exc:
+                try:
+                    cursor.execute("ROLLBACK")
+                except sqlite3.Error:  # pragma: no cover - connection already broken
+                    # The connection may be left inside a transaction (e.g. a
+                    # disk I/O error).  Reopen it so the next attempt starts from
+                    # a clean, retryable state instead of failing forever.  A
+                    # reconnect failure must not mask the StorageError below.
+                    try:
+                        self._reconnect()
+                    except sqlite3.Error:
+                        logger.warning("could not reopen the database connection")
+                # The transaction rolled back: the database still holds the last
+                # consistent snapshot, so the caller can safely retry.
+                raise StorageError(f"could not save scheduler state: {exc}") from exc
+
+    def _reconnect(self) -> None:  # pragma: no cover - error recovery path
+        try:
+            self._connection.close()
+        except sqlite3.Error:
+            pass
+        self._connection = sqlite3.connect(
+            str(self.path), check_same_thread=False, isolation_level=None
+        )
+        self._connection.row_factory = sqlite3.Row
+        self._connection.execute("PRAGMA journal_mode=WAL")
+        self._connection.execute("PRAGMA synchronous=NORMAL")
 
     def clear(self) -> None:
         with self.lock:

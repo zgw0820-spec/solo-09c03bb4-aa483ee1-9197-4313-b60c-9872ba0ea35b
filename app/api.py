@@ -27,7 +27,7 @@ from .models import (
     WorkerView,
 )
 from .scheduler import ConflictError, Scheduler
-from .store import Store
+from .store import StorageError, Store
 from .timeutil import iso as _iso
 
 logger = logging.getLogger("scheduler.api")
@@ -93,6 +93,22 @@ def create_app(
     async def _conflict_error(request: Request, exc: ConflictError) -> JSONResponse:
         return JSONResponse(status_code=409, content={"detail": str(exc)})
 
+    @app.exception_handler(StorageError)
+    async def _storage_error(request: Request, exc: StorageError) -> JSONResponse:
+        # Nothing was committed: the in-memory mutation has been rolled back and
+        # the database still holds the previous snapshot.  The operator can
+        # resubmit the identical request once SQLite is writable again.
+        logger.error("storage write failed on %s %s: %s", request.method, request.url.path, exc)
+        return JSONResponse(
+            status_code=503,
+            content={
+                "detail": (
+                    f"{exc}. Nothing was changed. Retry the request once the "
+                    "database is writable again."
+                )
+            },
+        )
+
     # ---------------------------------------------------------------- health
     @app.get("/health", tags=["ops"], summary="Scheduler liveness")
     async def health() -> dict:
@@ -133,7 +149,13 @@ def create_app(
                     "Rejected: the request is larger than the queue's current free "
                     "memory (e.g. while its ceiling is reduced by a loan)."
                 )
-            }
+            },
+            503: {
+                "description": (
+                    "The state could not be saved (SQLite temporarily unwritable). "
+                    "Nothing was admitted or reserved; retry the same request."
+                )
+            },
         },
     )
     async def submit_job(payload: JobCreate) -> JobView:
@@ -186,6 +208,12 @@ def create_app(
         responses={
             409: {"description": "A previous loan has not been fully returned yet."},
             422: {"description": "Invalid amount/duration, or exceeds the share."},
+            503: {
+                "description": (
+                    "The loan could not be saved (SQLite temporarily unwritable). "
+                    "No capacity moved and no loan exists; retry the same request."
+                )
+            },
         },
     )
     async def create_loan(payload: LoanCreate) -> LoanView:

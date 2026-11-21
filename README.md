@@ -46,6 +46,11 @@ All steps are available from Swagger (`/docs`).
    re-transcode queue).  A task is admitted only if its memory fits the queue's
    current free memory under its *effective* ceiling.  Otherwise `422`.
 
+   Submission is all-or-nothing: the job and its reservation become visible only
+   after the SQLite snapshot is saved.  If the database cannot be written the
+   request returns `503` (nothing is admitted, nothing is dispatched) and the
+   same request can be retried once storage is back.
+
 2. **Borrow capacity** — `POST /loans`
 
    ```json
@@ -56,6 +61,12 @@ All steps are available from Swagger (`/docs`).
    Only one loan may be outstanding at a time; a second request gets `409` until
    the first is fully returned.  `amount_mb` may not exceed the regular share's
    nominal ceiling.
+
+   The loan request is all-or-nothing as well: the lender's cap reduction, any
+   immediate handover to the borrower, and the loan record are saved in one
+   transaction.  If the save fails the request returns `503`, every cap is
+   restored and no loan (or outstanding-loan block) remains, so nothing that was
+   never confirmed can influence later admissions or be written by a later tick.
 
 3. **Watch** — `GET /capacity`, `GET /loans/{loan_id}` (or
    `GET /loans/{loan_id}/progress`).
@@ -144,6 +155,9 @@ python3 -m pytest -q
   restart, Swagger/OpenAPI smoke test.
 * `tests/test_scheduler_edges.py` — aborted loans, a "promise" loan larger than
   the current free memory, restart with a changed budget, unknown shares.
+* `tests/test_storage_failures.py` — a failed snapshot write at either entry
+  point rolls the in-memory change back, returns `503`, cannot be persisted by a
+  later tick or influence admission, and succeeds once storage recovers.
 
 ## Configuration
 

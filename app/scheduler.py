@@ -117,6 +117,13 @@ class Scheduler:
     def _persist(self) -> None:
         self.store.save_snapshot(self.shares, self.jobs, self.loans)
 
+    def _share_capsule(self) -> dict[str, int]:
+        return {name: share.cap_mb for name, share in self.shares.items()}
+
+    def _restore_share_capsule(self, caps: dict[str, int]) -> None:
+        for name, cap_mb in caps.items():
+            self.shares[name].cap_mb = cap_mb
+
     # -------------------------------------------------------------- lifecycle
     async def start(self) -> None:
         if self._ticker_task is None or self._ticker_task.done():
@@ -303,10 +310,20 @@ class Scheduler:
             duration_seconds=duration_seconds,
             submitted_at=now,
         )
+        # Admission and persistence are one unit: the reservation and the job
+        # become visible only after the snapshot is safely on disk.  If SQLite
+        # cannot write, undo both so the failed request consumes no capacity and
+        # the ticker can never dispatch (or persist) a job the client was told
+        # did not exist.
         pool.admit(memory_mb)
         self.jobs[job.job_id] = job
-        assert_budget_invariants(self.shares, self.settings.total_memory_mb)
-        self._persist()
+        try:
+            assert_budget_invariants(self.shares, self.settings.total_memory_mb)
+            self._persist()
+        except Exception:
+            self.jobs.pop(job.job_id, None)
+            pool.release(memory_mb)
+            raise
         return job
 
     # -------------------------------------------------------------- loans API
@@ -340,14 +357,24 @@ class Scheduler:
             created_at=now,
             release_started_at=now,
         )
-        open_loan(loan, self.shares, self.settings.total_memory_mb)
-        self.loans[loan.loan_id] = loan
+        # Request, any immediate handover and persistence are one unit.  If the
+        # snapshot cannot be written, restore every cap and drop the loan so a
+        # failed request neither moves capacity nor blocks the next admission or
+        # loan request.
+        capsule = self._share_capsule()
+        try:
+            open_loan(loan, self.shares, self.settings.total_memory_mb)
+            self.loans[loan.loan_id] = loan
+            # If the lender is already below the reduced cap we can hand over now.
+            self._advance_loans()
+            self._persist()
+        except Exception:
+            self.loans.pop(loan.loan_id, None)
+            self._restore_share_capsule(capsule)
+            raise
         logger.info(
             "loan %s requested: %d MB for %.1fs", loan.loan_id, amount_mb, duration_seconds
         )
-        # If the lender is already below the reduced cap we can hand over now.
-        self._advance_loans()
-        self._persist()
         return loan
 
     def list_loans(self) -> list[Loan]:
