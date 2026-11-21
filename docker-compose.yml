@@ -1,0 +1,95 @@
+x-app: &app
+  build:
+    context: .
+    dockerfile: Dockerfile
+
+services:
+  scheduler:
+    <<: *app
+    command:
+      - uvicorn
+      - app.api:create_app
+      - --factory
+      - --host
+      - 0.0.0.0
+      - --port
+      - "8000"
+    environment:
+      NODE_ID: node-local-1
+      TOTAL_MEMORY_MB: "4096"
+      REGULAR_SHARE_MB: "3072"
+      PATCH_SHARE_MB: "1024"
+      REGULAR_WORKER_URL: http://regular-worker:8020
+      PATCH_WORKER_URL: http://patch-worker:8020
+      TICK_INTERVAL_SECONDS: "0.2"
+      DATABASE_PATH: /data/scheduler.db
+    volumes:
+      - scheduler-data:/data
+    ports:
+      - "8000:8000"
+    depends_on:
+      regular-worker:
+        condition: service_healthy
+      patch-worker:
+        condition: service_healthy
+    healthcheck:
+      test:
+        - CMD
+        - python
+        - -c
+        - "import urllib.request;urllib.request.urlopen('http://127.0.0.1:8000/health', timeout=2)"
+      interval: 5s
+      timeout: 3s
+      retries: 10
+      start_period: 5s
+
+  regular-worker:
+    <<: *app
+    command:
+      - uvicorn
+      - worker.main:app
+      - --host
+      - 0.0.0.0
+      - --port
+      - "8020"
+    environment:
+      WORKER_NAME: regular-worker
+    ports:
+      - "8020:8020"
+    healthcheck:
+      test:
+        - CMD
+        - python
+        - -c
+        - "import urllib.request;urllib.request.urlopen('http://127.0.0.1:8020/health', timeout=2)"
+      interval: 5s
+      timeout: 3s
+      retries: 10
+      start_period: 3s
+
+  patch-worker:
+    <<: *app
+    command:
+      - uvicorn
+      - worker.main:app
+      - --host
+      - 0.0.0.0
+      - --port
+      - "8020"
+    environment:
+      WORKER_NAME: patch-worker
+    ports:
+      - "8021:8020"
+    healthcheck:
+      test:
+        - CMD
+        - python
+        - -c
+        - "import urllib.request;urllib.request.urlopen('http://127.0.0.1:8020/health', timeout=2)"
+      interval: 5s
+      timeout: 3s
+      retries: 10
+      start_period: 3s
+
+volumes:
+  scheduler-data:
